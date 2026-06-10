@@ -11,6 +11,7 @@ decompile each, and print a summary. Fully unattended.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import time
@@ -72,8 +73,21 @@ def contract_name(src: str) -> str:
     return names[-1] if names else "?"
 
 
-def _scan_block(bn: int, seen: set, want: int, results: list, stats: dict) -> None:
-    """Scan one block's call targets, appending verified decompiles to `results`."""
+SLOW_MS = 3000   # only dump source for slow/error cases, to keep disk/memory bounded
+
+
+def _scan_block(bn: int, seen: set, want: int, results: list, stats: dict, outdir: str,
+                corpus_dir: str | None = None, manifest: list | None = None) -> None:
+    """Scan one block's call targets, appending verified decompile *stats* to results.
+
+    For scale (1000s of contracts) we keep only numeric stats in memory, never the
+    full source; source is dumped to disk solely for slow or failing contracts so
+    they can be inspected afterwards.
+
+    If `corpus_dir` is given, every verified contract's runtime bytecode (.bin),
+    verified source (.sol) and a manifest row are saved there, building a reusable
+    offline test corpus (see scripts/run_corpus.py).
+    """
     blk = rpc("eth_getBlockByNumber", [hex(bn), True])
     addrs = []
     for tx in blk["transactions"]:
@@ -81,7 +95,8 @@ def _scan_block(bn: int, seen: set, want: int, results: list, stats: dict) -> No
         if to and to.lower() not in seen:
             seen.add(to.lower())
             addrs.append(to)
-    print(f"block {bn}: {len(blk['transactions'])} txs, {len(addrs)} new addresses", flush=True)
+    print(f"block {bn}: {len(blk['transactions'])} txs, {len(addrs)} new addrs "
+          f"(have {len(results)}/{want})", flush=True)
 
     for addr in addrs:
         if len(results) >= want:
@@ -89,7 +104,7 @@ def _scan_block(bn: int, seen: set, want: int, results: list, stats: dict) -> No
         stats["scanned"] += 1
         # Source check FIRST (blockscan is lenient); only hit rate-limited RPC on hits.
         src = fetch_source(addr)
-        time.sleep(0.2)
+        time.sleep(0.15)
         if src is None:
             continue
         try:
@@ -102,79 +117,115 @@ def _scan_block(bn: int, seen: set, want: int, results: list, stats: dict) -> No
 
         name = contract_name(src)
         codeb = from_hex(code)
+
+        # Save into the reusable offline corpus (bytecode + source + manifest row).
+        if corpus_dir is not None:
+            try:
+                with open(os.path.join(corpus_dir, f"{addr}.bin"), "w") as f:
+                    f.write(code)
+                with open(os.path.join(corpus_dir, f"{addr}.sol"), "w") as f:
+                    f.write(src)
+            except Exception:  # noqa: BLE001
+                pass
+
         try:
             t = time.time()
             out = decompile(codeb)
             dt = (time.time() - t) * 1000
             funcs = find_functions(codeb)
-            named = sum(1 for f in funcs if f.signature)
+            nfuncs, named = len(funcs), sum(1 for f in funcs if f.signature)
             unresolved = out.count("unresolved dynamic jump site")
+            nlines = out.count("\n") + 1
             status = "ok"
         except Exception as e:  # noqa: BLE001
-            dt, funcs, named, unresolved, status = 0, [], 0, 0, f"ERROR: {type(e).__name__}: {e}"
-            out = ""
+            dt, nfuncs, named, unresolved, nlines, status = 0, 0, 0, 0, 0, type(e).__name__
+            out = f"// ERROR: {type(e).__name__}: {e}"
             stats["errors"][type(e).__name__] = stats["errors"].get(type(e).__name__, 0) + 1
 
         n = len(results) + 1
-        flag = "" if status == "ok" else "  <<<"
-        print(
-            f"[{n:2}] {addr}  {(name or '?')[:20]:20}  "
-            f"{len(funcs):3} fns ({named:2} named)  {len(out.splitlines()):5} lines  "
-            f"{dt:6.0f}ms  unres={unresolved}  {status}{flag}",
-            flush=True,
-        )
-        results.append((addr, name, len(funcs), named, unresolved, dt, out, status))
+        notable = status != "ok" or dt > SLOW_MS
+        if notable:
+            try:
+                with open(os.path.join(outdir, f"{name}_{addr[:10]}.sol"), "w") as f:
+                    f.write(out)
+            except Exception:  # noqa: BLE001
+                pass
+        if notable or n % 50 == 0:
+            flag = "  <<<" if status != "ok" else ("  <slow>" if dt > SLOW_MS else "")
+            print(f"[{n:4}] {addr}  {(name or '?')[:18]:18}  {nfuncs:3} fns  "
+                  f"{nlines:6} L  {dt:7.0f}ms  {status}{flag}", flush=True)
+        if manifest is not None:
+            manifest.append({"address": addr, "name": name, "block": bn,
+                             "functions": nfuncs, "named": named, "lines": nlines,
+                             "decompile_ms": round(dt), "status": status})
+        results.append((addr, name, nfuncs, named, unresolved, dt, nlines, status))
+
+
+def _pct(sorted_vals: list, p: float):
+    return sorted_vals[min(len(sorted_vals) - 1, int(len(sorted_vals) * p))]
 
 
 def main() -> int:
-    import os
-
     block = int(sys.argv[1]) if len(sys.argv) > 1 else 20_000_000
     want = int(sys.argv[2]) if len(sys.argv) > 2 else 10
     max_blocks = int(sys.argv[3]) if len(sys.argv) > 3 else 60
 
-    print(f"target: {want} verified contracts, starting at block {block}\n", flush=True)
+    root = os.path.dirname(os.path.dirname(__file__))
+    outdir = os.path.join(root, "out_batch")
+    corpus_dir = os.path.join(root, "corpus")
+    os.makedirs(outdir, exist_ok=True)
+    os.makedirs(corpus_dir, exist_ok=True)
+    print(f"target: {want} verified contracts from block {block} "
+          f"(dumping source only for errors / >{SLOW_MS}ms)\n"
+          f"corpus (bytecode+source) -> {corpus_dir}/\n", flush=True)
     seen: set[str] = set()
     results: list = []
+    manifest: list = []
     stats = {"scanned": 0, "rpc_fail": 0, "errors": {}}
 
+    start = time.time()
+    boff = 0
     for boff in range(max_blocks):
         if len(results) >= want:
             break
         try:
-            _scan_block(block + boff, seen, want, results, stats)
+            _scan_block(block + boff, seen, want, results, stats, outdir, corpus_dir, manifest)
         except Exception as e:  # noqa: BLE001
             print(f"block {block + boff} skipped: {e}", flush=True)
             time.sleep(1.0)
 
+    with open(os.path.join(corpus_dir, "manifest.json"), "w") as f:
+        json.dump(manifest, f, indent=2)
+
     # ---- summary -------------------------------------------------------
     ok = [r for r in results if r[7] == "ok"]
-    print(f"\n{'='*70}")
-    print(f"scanned {stats['scanned']} addresses across {boff + 1} block(s)")
+    elapsed = time.time() - start
+    print(f"\n{'='*72}")
+    print(f"scanned {stats['scanned']} addresses across {boff + 1} block(s) in {elapsed:.0f}s")
     print(f"decompiled: {len(results)} verified contracts")
     print(f"clean: {len(ok)}/{len(results)}   "
           f"({100*len(ok)//max(len(results),1)}%)   rpc_fail={stats['rpc_fail']}")
     if stats["errors"]:
         print("error breakdown:")
         for etype, cnt in sorted(stats["errors"].items(), key=lambda x: -x[1]):
-            print(f"    {cnt:3}x  {etype}")
+            print(f"    {cnt:4}x  {etype}")
     if ok:
         times = sorted(r[5] for r in ok)
-        lines = sorted(len(r[6].splitlines()) for r in ok)
-        print(f"decompile time  min/median/max = "
-              f"{times[0]:.0f} / {times[len(times)//2]:.0f} / {times[-1]:.0f} ms")
-        print(f"output lines    min/median/max = "
-              f"{lines[0]} / {lines[len(lines)//2]} / {lines[-1]}")
+        lines = sorted(r[6] for r in ok)
+        print(f"decompile time  p50/p90/p99/max = "
+              f"{_pct(times,.5):.0f} / {_pct(times,.9):.0f} / "
+              f"{_pct(times,.99):.0f} / {times[-1]:.0f} ms")
+        print(f"output lines    p50/p90/max = "
+              f"{_pct(lines,.5)} / {_pct(lines,.9)} / {lines[-1]}")
+        print(f"contracts > {SLOW_MS}ms: {sum(1 for r in ok if r[5] > SLOW_MS)}")
         print(f"total functions recovered: {sum(r[2] for r in ok)}, "
-              f"with unresolved jumps: {sum(1 for r in ok if r[4])}")
-
-    outdir = os.path.join(os.path.dirname(__file__), "..", "out_batch")
-    os.makedirs(outdir, exist_ok=True)
-    for addr, name, *_mid, out, status in results:
-        if out:
-            with open(os.path.join(outdir, f"{name}_{addr[:10]}.sol"), "w") as f:
-                f.write(out)
-    print(f"full sources -> {os.path.normpath(outdir)}/")
+              f"unresolved-jump contracts: {sum(1 for r in ok if r[4])}")
+        slow = sorted((r for r in ok if r[5] > SLOW_MS), key=lambda r: -r[5])[:10]
+        if slow:
+            print("slowest:")
+            for r in slow:
+                print(f"   {r[5]:7.0f}ms  {r[6]:6}L  {(r[1] or '?')[:22]:22}  {r[0]}")
+    print(f"source dumps (errors/slow only) -> {os.path.normpath(outdir)}/")
     return 0
 
 

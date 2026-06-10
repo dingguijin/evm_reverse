@@ -147,6 +147,8 @@ def render(sym: Sym) -> str:
 
     if op == "NOT":
         return f"~{render(args[0])}"
+    if op == "HUGE":
+        return "/* complex expr */"
     if op == "STACK_IN":
         return f"stack_in{args[0].value}"
     if op == "CALLRET":

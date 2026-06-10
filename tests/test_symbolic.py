@@ -1,15 +1,21 @@
 import os
+import time
 
 from evmdec.cfg import build_cfg
+from evmdec.decompiler import decompile
 from evmdec.disassembler import from_hex
-from evmdec.symbolic import Const, Expr, SymExec, complete_cfg, mk
+from evmdec.symbolic import MAX_EXPR_SIZE, Const, Expr, SymExec, complete_cfg, mk
 
 FIXTURE = os.path.join(os.path.dirname(__file__), "storage.bin")
 
 
-def _load():
-    with open(FIXTURE) as f:
+def _load_file(name: str) -> bytes:
+    with open(os.path.join(os.path.dirname(__file__), name)) as f:
         return from_hex(f.read())
+
+
+def _load() -> bytes:
+    return _load_file("storage.bin")
 
 
 def test_constant_folding():
@@ -48,6 +54,30 @@ def test_complete_cfg_clears_unresolved_flags():
     assert after == 0
     # the internal call into the calldata-decode helper was dynamic
     assert 0x01B0 in {t for ts in resolved.values() for t in ts}
+
+
+def test_mk_collapses_runaway_dag():
+    # Doubling builds an exponentially-large expansion; mk() must collapse it so
+    # size (and therefore hash/eq/render cost) stays bounded.
+    x = Expr("CALLDATALOAD", (Const(0),))
+    collapsed = False
+    for _ in range(80):
+        x = mk("ADD", x, x)
+        collapsed = collapsed or x.op == "HUGE"
+    # without bounding, 80 doublings would be 2**80 nodes; it must stay bounded
+    assert x.size <= MAX_EXPR_SIZE
+    assert collapsed  # the runaway DAG was collapsed at least once
+
+
+def test_pathological_contract_decompiles_fast():
+    # Regression: this real EIP-712 contract (mainnet 0x14778860...) took 357s
+    # before expression-size bounding; must now finish in a couple of seconds.
+    code = _load_file("eip712_slow.bin")
+    t = time.time()
+    out = decompile(code)
+    dt = time.time() - t
+    assert dt < 20, f"decompile took {dt:.0f}s, expected ~2s (exponential blowup regressed?)"
+    assert "/* complex expr */" in out
 
 
 def test_node_budget_truncates_cleanly():

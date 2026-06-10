@@ -40,7 +40,15 @@ _PANIC_SELECTOR = 0x4E487B71   # Panic(uint256)
 class Sym:
     """Base class for symbolic values."""
 
-    __slots__ = ()
+    size = 1   # number of expression nodes; overridden on Expr
+
+
+# Cap on expression node count. Symbolic execution can build exponentially
+# large expression DAGs (e.g. repeated DUP+arithmetic in EIP-712 hashing or ABI
+# offset math); since Sym is a frozen dataclass its hash/eq recurse without
+# memoizing, so a single `mk()` on a huge DAG could take *minutes*. Collapsing
+# anything past this bound keeps every later hash/eq/render O(MAX_EXPR_SIZE).
+MAX_EXPR_SIZE = 1500
 
 
 @dataclass(frozen=True)
@@ -52,6 +60,9 @@ class Const(Sym):
 class Expr(Sym):
     op: str
     args: tuple = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "size", 1 + sum(getattr(a, "size", 1) for a in self.args))
 
 
 def _signed(x: int) -> int:
@@ -175,7 +186,12 @@ def mk(op: str, *args: Sym) -> Sym:
             ):
                 return val
 
-    return Expr(op, tuple(args))
+    result = Expr(op, tuple(args))
+    if result.size > MAX_EXPR_SIZE:
+        # Runaway DAG: collapse to an opaque, bounded node so every later
+        # hash/eq/render stays cheap. The size is kept for diagnostics.
+        return Expr("HUGE", (Const(result.size),))
+    return result
 
 
 def contains(sym: Sym, op: str) -> bool:

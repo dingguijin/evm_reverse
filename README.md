@@ -67,6 +67,27 @@ like mapping slots `storage[keccak256(key, slot)]` and revert reasons.
 `scripts/onchain_batch.py` pulls verified contracts from a block and decompiles
 them in bulk — used to stress-test against real mainnet code.
 
+## Offline test corpus
+
+The decompiler is stress-tested against real mainnet contracts without hitting
+any RPC at test time. Build a local corpus once, then replay it offline as many
+times as you like:
+
+```bash
+# build: pull N verified contracts starting at a block, saving each one's
+# runtime bytecode (.bin) + verified source (.sol) into corpus/
+python3 scripts/onchain_batch.py <block> <N> <max_blocks>
+#   e.g.  python3 scripts/onchain_batch.py 21100000 1000 60
+
+# replay: decompile every corpus/*.bin locally — no network, ~tens of seconds
+python3 scripts/run_corpus.py
+```
+
+The corpus (`corpus/`, ~60 MB for 1000 contracts) is **gitignored** — it is not
+committed; rebuild it on any machine with the command above. Each contract is
+stored as `corpus/<addr>.bin` + `corpus/<addr>.sol`, with `corpus/manifest.json`
+listing metadata (name, function count, decompile time, source block).
+
 ## Limitations
 
 - Loops are unrolled then truncated, not recovered as `while`/`for`.
