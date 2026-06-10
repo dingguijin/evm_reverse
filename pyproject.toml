@@ -1,0 +1,21 @@
+[project]
+name = "evmdec"
+version = "0.1.0"
+description = "An EVM bytecode decompiler, built bottom-up (disasm -> CFG -> functions -> symbolic -> pseudocode)"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest"]
+# py-solc-x is used only to (re)generate test fixtures from Solidity source.
+fixtures = ["py-solc-x"]
+
+[project.scripts]
+evmdec = "evmdec.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["evmdec"]

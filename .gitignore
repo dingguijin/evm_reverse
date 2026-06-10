@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Generated decompiler output (can be hundreds of MB)
+out_batch/
+
+# Local Claude Code permission settings (machine-specific)
+.claude/settings.local.json

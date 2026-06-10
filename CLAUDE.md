@@ -1,0 +1,94 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+`evmdec` is an EVM bytecode decompiler written in pure Python (no runtime deps).
+It is built **bottom-up as a stack of layers**, each consuming the layer below and
+producing an independently inspectable artifact. The guiding principle: every layer
+has its own CLI subcommand so intermediate results (`disasm -> cfg -> functions ->
+... -> pseudocode`) can be viewed and tested in isolation.
+
+## Commands
+
+```bash
+# run a layer on a hex string or a file containing hex
+python3 -m evmdec disasm    <hex|file>   # M1: bytecode -> instruction listing
+python3 -m evmdec cfg        <hex|file>   # M2: basic blocks + edges
+python3 -m evmdec functions  <hex|file>   # M3: selector table + recovered signatures
+python3 -m evmdec symbolic   <hex|file>   # M4: resolved dynamic jumps + completed CFG
+python3 -m evmdec decompile  <hex|file>   # M5: Solidity-like pseudocode
+
+# tests
+python3 -m pytest tests/ -q              # full suite
+python3 -m pytest tests/test_cfg.py -q   # one file
+python3 -m pytest tests/test_cfg.py::test_static_jump_edges_resolved   # one test
+
+# regenerate the test fixture (needs: pip install py-solc-x --break-system-packages)
+# tests/storage.bin is the bin-runtime of a 4-function sample contract.
+```
+
+Two pinned fixtures (solc 0.8.26 bin-runtime; tests assert exact offsets/selectors):
+- `tests/storage.bin` — `set(uint256)`, `get()`, `add(uint256,uint256)`, `owner()`.
+- `tests/token.bin` — mapping + events + revert strings + a for-loop (`mint`,
+  `balanceOf`, `transfer`, `totalSupply`, `sumTo`); exercises M4/M5 edge cases.
+
+## Architecture (layers, bottom to top)
+
+- `opcodes.py` — **foundation.** `OPCODES: dict[int, OpInfo]` maps every byte to its
+  mnemonic, immediate length (PUSH data), and stack in/out counts. Stack counts exist
+  specifically so symbolic execution (M4) can model stack effects generically. Use
+  `lookup(byte)` — it synthesises an `UNKNOWN_xx` terminator for undefined bytes.
+- `disassembler.py` — **M1.** `disassemble(code)` -> `list[Instruction]`. The one
+  correctness-critical detail: PUSHn immediates are skipped, never decoded as opcodes.
+  `strip_metadata()` removes the trailing CBOR solc metadata before decoding.
+- `cfg.py` — **M2.** `build_cfg(code)` -> `CFG`. Leaders = offset 0, every JUMPDEST,
+  and the instruction after any branch/terminator. Edges resolved statically only for
+  the `PUSH <dest>; JUMP/JUMPI` pattern (`_static_jump_target`). Computed jump targets
+  are flagged `has_unresolved_jump` and deferred to M4.
+- `keccak.py` — pure-Python **Keccak-256** (Ethereum variant, padding byte 0x01 — NOT
+  hashlib's SHA3). Powers selectors, event topics, and mapping storage-slot math.
+- `fourbyte.py` / `selectors.py` — **M3.** `find_functions(code)` scans for
+  `PUSH4 <sel> EQ ... PUSH <dest> JUMPI` dispatcher windows. Selectors are named via an
+  offline keccak-computed table (`resolve_signature`, optional `online=True` 4byte API);
+  `resolve_event(topic0)` does the same for LOG topic hashes.
+- `symbolic.py` — **M4.** Path-forking symbolic execution. `Const`/`Expr` values with a
+  constant-folding smart constructor `mk()` (this is what resolves dynamic jumps: pushed
+  return addresses fold to constants, so internal call/return "just works"). Forks at
+  symbolic JUMPI; loops cut after `max_block_visits` revisits (loops are *unrolled*, not
+  recovered). Word-granular symbolic memory recovers ABI returns / revert reasons (Error
+  string + Panic code). Products: `complete_cfg()` and a `TraceNode` tree of effect
+  statements (SStore/Return/Revert/Log/Call/...) for M5. Expression args are stored in
+  **pop order** (args[0] = stack top) — renderers must respect operand semantics.
+  Bounded by `max_nodes` (default 8000, path-explosion guard) and a `max_seconds`
+  wall-clock budget (default 5s, checked every 64 nodes); either sets `ex.truncated`
+  and cuts the trace. These bound BOTH M4 and the M5 post-processing that walks the
+  tree — a 20000-node tree made 1inch AggregationRouterV5 take ~22s end-to-end
+  (M4 ~9s + M5 tree-walks ~8s); 8000 nodes brings it to ~6s. Normal contracts have
+  far fewer nodes (WETH ~900) and are unaffected.
+  Carries a per-path *assumptions* map (`_known`/`_fork_assumptions`): when a JUMPI forks,
+  the condition is recorded true/false down each arm, so re-testing the same symbolic
+  condition folds instead of forking again. This kills degenerate `if (x){ if (x){} }`
+  nesting (e.g. WETH transferFrom). It does NOT merge common path *suffixes*, so shared
+  tails are still duplicated across arms — that needs real control-flow merging.
+- `ir.py` — **M5a.** Renders Sym/Stmt to source-level text: `CALLER`->`msg.sender`,
+  `SLOAD(k)`->`storage[k]`, `CALLDATALOAD(4+32i)`->`arg{i}`, negation-aware `ISZERO`
+  (`ISZERO(LT)` -> `>=`), address masks dropped, panic codes annotated.
+- `decompiler.py` — **M5b.** `decompile(code)`: walks the dispatcher spine of the trace
+  tree (selector-EQ branch -> function body; pure-revert arm -> `require(...)`), emits
+  per-function pseudocode with mutability inference (view/pure) and a storage-layout
+  summary (const slots + mapping base slots from `SHA3(key, slot)`).
+
+## Milestone status
+
+**All five milestones implemented** (M1 disasm, M2 CFG, M3 functions/ABI, M4 symbolic,
+M5 decompile). Known limitations / future work:
+- loops are unrolled then truncated (`max_block_visits`), not recovered as `while`/`for`;
+- no SSA — expressions are re-rendered at each use, so repeated `storage[keccak(...)]`
+  reads are verbose (no common-subexpression naming);
+- function return types are unknown (4byte signatures don't carry them);
+- dynamic types (string/bytes/arrays in calldata) decode as raw word arithmetic.
+
+When extending: keep each layer pure and independently testable, add a CLI subcommand
+and a `tests/test_<layer>.py` pinned to the fixtures, and run the full suite.
