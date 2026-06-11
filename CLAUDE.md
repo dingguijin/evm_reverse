@@ -104,7 +104,14 @@ M5 decompile). Known limitations / future work:
 - CSE names only *function-invariant* repeats; values that change (a mutated balance
   read before vs after its SSTORE) are still re-rendered inline — full SSA with
   span-scoped naming would dedup those too;
-- function return types are unknown (4byte signatures don't carry them);
+- return types are *inferred* (`_infer_return_type` in decompiler.py) — `returns (...)`
+  is emitted from how each function builds its value: address/bool/narrow-uint masks,
+  address literals (160-bit constants), dynamic memory ranges (bytes/string, which are
+  bytecode-identical), and contract-wide storage-slot types learned from masked
+  writes / onlyOwner comparisons / call targets (`_collect_slot_types`). Verified at
+  *class* granularity vs solc ABI outputs: ~86% scalar match, ~92% void
+  (`scripts/verify_returns.py`). Still unrecoverable: narrow-uint/bool read from a slot
+  set only in the constructor (no runtime mask to learn from), and signedness;
 - dynamic types (string/bytes/arrays in calldata) decode as raw word arithmetic.
 
 When extending: keep each layer pure and independently testable, add a CLI subcommand

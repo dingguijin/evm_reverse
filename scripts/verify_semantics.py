@@ -32,7 +32,8 @@ from evmdec.keccak import keccak256, selector as keccak_sel   # noqa: E402
 from verify_abi import _canon, compile_abi_items, is_vyper    # noqa: E402
 
 _FN_HEADER = re.compile(
-    r"function \w*\([^)]*\) public( view| pure)? \{  // selector 0x([0-9a-f]{8})")
+    r"function \w*\([^)]*\) public( view| pure)?(?: returns \([^)]*\))?"
+    r" \{  // selector 0x([0-9a-f]{8})")
 _RAW_EMIT = re.compile(r"emit log\((0x[0-9a-f]+)[,)]")
 _NAMED_EMIT = re.compile(r"emit (?!log\b)(\w+)\(")
 _REVERT_STR = re.compile(r'(?:require\([^\n]*?, |revert\()"([^"\\]+)"\)')

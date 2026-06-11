@@ -101,3 +101,17 @@ def test_cse_names_repeated_invariants():
     for name in defs:
         uses = len(re.findall(rf"\b{name}\b", out))
         assert uses >= 2, f"{name} defined but never reused ({uses} occurrence)"
+
+
+def test_return_types_inferred():
+    # WETH exercises every inference path: bool (transfer/approve), uint256
+    # (balanceOf/totalSupply), uint8 (decimals, from the 0xff mask), dynamic
+    # bytes/string (name/symbol), and void (deposit/withdraw).
+    path = os.path.join(os.path.dirname(__file__), "weth.bin")
+    with open(path) as f:
+        out = decompile(from_hex(f.read()))
+    assert "function transfer(address arg0, uint256 arg1) public returns (bool)" in out
+    assert "function balanceOf(address arg0) public view returns (uint256)" in out
+    assert "function decimals() public view returns (uint8)" in out
+    assert "function name() public view returns (bytes)" in out          # string≡bytes
+    assert re.search(r"function withdraw\([^)]*\) public\b(?! returns)", out)

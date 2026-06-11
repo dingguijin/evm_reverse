@@ -245,6 +245,191 @@ def _analyze(node: TraceNode, acc: _Analysis | None = None) -> _Analysis:
     return acc
 
 
+# ---------------------------------------------------------------- return types
+
+ADDRESS_MASK = (1 << 160) - 1
+_BOOL_OPS = {"LT", "GT", "SLT", "SGT", "EQ", "ISZERO"}
+
+
+def _scalar_type(sym: Sym, slot_types: dict | None = None) -> str:
+    """Best-effort solidity type of a single returned word."""
+    if isinstance(sym, Const):
+        # an immutable/literal address: 160-bit value with nonzero high bytes.
+        # plain uint amounts almost never land in (2^96, 2^160).
+        if 96 < sym.value.bit_length() <= 160:
+            return "address"
+        return "uint256"
+    if isinstance(sym, Expr):
+        if slot_types:
+            # a value read straight from a typed storage slot keeps that type
+            # (addresses/narrow-uints/bools lose their mask on read, but the
+            # slot was written masked — so the write site tells us the type)
+            if sym.op == "SLOAD":
+                k = sym.args[0]
+                if isinstance(k, Const) and k.value in slot_types:
+                    return slot_types[k.value]
+                base = _mapping_base(k)
+                if base is not None and ("m", base) in slot_types:
+                    return slot_types[("m", base)]
+        if sym.op == "AND" and len(sym.args) == 2:
+            for mask, other in ((sym.args[0], sym.args[1]), (sym.args[1], sym.args[0])):
+                if isinstance(mask, Const):
+                    if mask.value == ADDRESS_MASK:
+                        return "address"
+                    if mask.value == 1:
+                        return "bool"
+                    # 0xff, 0xffff, ... -> uintN (skip the full-width all-ones)
+                    n = mask.value.bit_length()
+                    if mask.value == (1 << n) - 1 and n % 8 == 0 and n < 256:
+                        # the inner value's own type wins if it's narrower still
+                        inner = _scalar_type(other, slot_types)
+                        return inner if inner.startswith(("uint", "address", "bool")) \
+                            and inner != "uint256" else f"uint{n}"
+        if sym.op in _BOOL_OPS:
+            return "bool"
+    return "uint256"
+
+
+def _slot_key(load: Sym):
+    """Storage key (const slot or ('m', base)) addressed by an SLOAD, else None."""
+    if isinstance(load, Expr) and load.op == "SLOAD":
+        k = load.args[0]
+        if isinstance(k, Const):
+            return k.value
+        base = _mapping_base(k)
+        if base is not None:
+            return ("m", base)
+    return None
+
+
+_ADDRESSY = {"CALLER", "ORIGIN", "ADDRESS", "COINBASE"}
+
+
+def _collect_slot_types(bodies) -> dict:
+    """Map const slot / ('m', base) -> solidity type, learned contract-wide.
+
+    Evidence (any of, must be consistent):
+      - a masked value written to the slot (`storage[k] = addr & MASK`);
+      - a masked *read* of the slot (`addr & MASK`, `x & 0xff`);
+      - the slot compared to an address env value (`msg.sender == storage[k]`,
+        the onlyOwner pattern);
+      - the slot used as an external-call target.
+    A slot with conflicting specific evidence is left untyped (uint256)."""
+    seen: dict = {}
+    conflict: set = set()
+
+    def note(key, t: str) -> None:
+        if key is None or t == "uint256" or key in conflict:
+            return
+        if key in seen and seen[key] != t:
+            conflict.add(key)
+            seen.pop(key, None)
+        else:
+            seen[key] = t
+
+    def scan(sym: Sym) -> None:
+        if not isinstance(sym, Expr):
+            return
+        if sym.op == "AND" and len(sym.args) == 2:
+            a, b = sym.args
+            for mask, other in ((a, b), (b, a)):
+                if isinstance(mask, Const):
+                    t = _scalar_type(sym)            # reuse mask->type logic
+                    if t != "uint256":
+                        note(_slot_key(other), t)
+        elif sym.op == "EQ" and len(sym.args) == 2:
+            a, b = sym.args
+            for x, y in ((a, b), (b, a)):
+                if isinstance(x, Expr) and x.op in _ADDRESSY:
+                    note(_slot_key(y), "address")
+        for a in sym.args:
+            scan(a)
+
+    def visit(n: TraceNode) -> None:
+        for s in n.stmts:
+            if isinstance(s, SStore):
+                t = _scalar_type(s.value)
+                if isinstance(s.slot, Const):
+                    note(s.slot.value, t)
+                elif (base := _mapping_base(s.slot)) is not None:
+                    note(("m", base), t)
+            if isinstance(s, Call):
+                note(_slot_key(s.to), "address")
+            for v in s.__dict__.values():
+                if isinstance(v, Sym):
+                    scan(v)
+                elif isinstance(v, list):
+                    for x in v:
+                        if isinstance(x, Sym):
+                            scan(x)
+        if n.branch:
+            scan(n.branch.cond)
+            visit(n.branch.true)
+            visit(n.branch.false)
+
+    for b in bodies:
+        visit(b)
+    return seen
+
+
+def _return_columns(r, slot_types: dict) -> list[str] | None:
+    """Per-word inferred types for one Return, or None if it's a dynamic
+    (offset+length) ABI encoding whose shape we can't split."""
+    if r.values is not None:
+        return [_scalar_type(v, slot_types) for v in r.values]
+    # raw memory range: a constant whole-word size is a scalar/struct we just
+    # couldn't reconstruct symbolically (-> uint256 words); a symbolic or
+    # ragged size is a genuine dynamic value.
+    if isinstance(r.size, Const) and r.size.value % 32 == 0:
+        return ["uint256"] * (r.size.value // 32)
+    return None
+
+
+def _infer_return_type(node: TraceNode, slot_types: dict) -> str:
+    """Inferred `returns (...)` clause (without the keyword), or "" for void."""
+    rets: list = []
+
+    def visit(n: TraceNode) -> None:
+        for s in n.stmts:
+            if isinstance(s, Return):
+                rets.append(s)
+        if n.branch:
+            visit(n.branch.true)
+            visit(n.branch.false)
+
+    visit(node)
+    if not rets:
+        return ""
+    col_lists = [_return_columns(r, slot_types) for r in rets]
+    if any(c is None for c in col_lists):           # a truly dynamic return
+        return "bytes"
+    arity = max((len(c) for c in col_lists), default=0)
+    if arity == 0:
+        return ""                                   # explicit `return;` only
+    cols: list[set[str]] = [set() for _ in range(arity)]
+    all_const_bit = True
+    for r, c in zip(rets, col_lists):
+        if r.values is None or len(r.values) != 1:
+            all_const_bit = False
+        for i, t in enumerate(c):
+            cols[i].add(t)
+        if r.values is not None:
+            for v in r.values:
+                if not (isinstance(v, Const) and v.value in (0, 1)):
+                    all_const_bit = False
+
+    def merge(types: set[str]) -> str:
+        types.discard("uint256")
+        if len(types) == 1:
+            return types.pop()
+        return "uint256"                            # disagreement / all-default
+
+    parts = [merge(c) for c in cols]
+    if arity == 1 and parts[0] == "uint256" and all_const_bit:
+        parts[0] = "bool"                            # `return true/false;`
+    return ", ".join(parts)                          # caller wraps in returns(...)
+
+
 # ---------------------------------------------------------------- CSE naming
 
 # Reading these means a value can change across an external call, so it is not
@@ -436,6 +621,9 @@ def decompile(code: bytes) -> str:
     for fb in fallbacks:
         info = _analyze(fb, overall)   # folds straight into the global layout
 
+    # storage-slot types, learned contract-wide, sharpen return-type inference
+    slot_types = _collect_slot_types([b for _, b, _, _ in fn_render] + fallbacks)
+
     # Phase 2: render.
     lines: list[str] = ["// decompiled by evmdec", "contract Decompiled {"]
     summary = []
@@ -450,7 +638,10 @@ def decompile(code: bytes) -> str:
     for selector, body, guards, mutability in fn_render:
         fn = known.get(selector)
         header = _signature_header(selector, fn.signature if fn else None)
-        lines.append(f"{INDENT}{header}{mutability} {{  // selector 0x{selector:08x}")
+        ret = _infer_return_type(body, slot_types)
+        ret_clause = f" returns ({ret})" if ret else ""
+        lines.append(f"{INDENT}{header}{mutability}{ret_clause} {{  "
+                     f"// selector 0x{selector:08x}")
         bindings, _ = _cse_bindings(body, guards)
         for name, defn in bindings:
             lines.append(INDENT * 2 + f"{name} = {defn};")
