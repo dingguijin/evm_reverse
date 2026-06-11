@@ -33,7 +33,12 @@ def _selector_of(cond: Sym) -> int | None:
         a, b = cond.args
         for const, other in ((a, b), (b, a)):
             if isinstance(const, Const) and _mentions_calldata0(other):
-                return const.value
+                val = const.value
+                # solc >=0.8.20 compares against the selector left-aligned in
+                # a full word; normalise back down to the 4-byte value.
+                if val > 0xFFFFFFFF and val & ((1 << 224) - 1) == 0:
+                    val >>= 224
+                return val
     return None
 
 

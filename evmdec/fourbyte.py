@@ -24,6 +24,7 @@ _COMMON_SIGNATURES = [
     "owner()", "transferOwnership(address)", "renounceOwnership()",
     "mint(address,uint256)", "burn(uint256)", "pause()", "unpause()",
     "deposit()", "withdraw(uint256)", "implementation()", "admin()",
+    "upgradeToAndCall(address,bytes)",
     # our sample contract
     "set(uint256)", "get()", "add(uint256,uint256)",
 ]

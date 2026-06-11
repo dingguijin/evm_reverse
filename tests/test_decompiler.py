@@ -75,3 +75,13 @@ def test_loop_truncated_not_hung():
     out = _token_output()
     # sumTo()'s for-loop is unrolled by path execution and then cut off
     assert "truncated" in out
+
+
+def test_shifted_dispatcher_selector_named():
+    # OZ v5 proxy (solc 0.8.20+): the dispatcher compares the selector
+    # left-aligned in a full word; it must still resolve to upgradeToAndCall.
+    path = os.path.join(os.path.dirname(__file__), "proxy_shifted.bin")
+    with open(path) as f:
+        out = decompile(from_hex(f.read()))
+    assert "function upgradeToAndCall(address arg0, bytes arg1) public" in out
+    assert "// selector 0x4f1ef286" in out
