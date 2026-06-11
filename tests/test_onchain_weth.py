@@ -63,7 +63,11 @@ def test_nested_mapping_allowance_recovered():
 
 def test_transferfrom_no_redundant_nested_branch():
     # Path-condition memory collapses the degenerate `if (x) { if (x) {...} }`:
-    # once `arg0 == msg.sender` is decided, re-testing it folds to a constant.
+    # once the sender==from check is decided, re-testing it folds to a constant.
+    # Common-suffix merging then hoists the shared balance-transfer tail out and
+    # inverts the empty then-arm, so the check appears exactly once (as `!=`).
     out = decompile(_code())
     body = re.search(r"function transferFrom.*?\n    \}", out, re.S).group(0)
-    assert body.count("(arg0 == msg.sender)") == 1
+    assert body.count("arg0 == msg.sender") + body.count("arg0 != msg.sender") == 1
+    # the balance-transfer suffix must be merged, not duplicated per branch
+    assert body.count("emit Transfer(arg0, arg1, arg2);") == 1

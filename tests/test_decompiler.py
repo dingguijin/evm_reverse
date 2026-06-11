@@ -125,3 +125,13 @@ def test_dynamic_calldata_length():
         out = decompile(from_hex(f.read()))
     assert "arg1.length" in out
     assert "calldata[(4 + arg1)]" not in out
+
+
+def test_common_suffix_merged():
+    # The token fixture's mint/transfer share storage-write + emit tails across
+    # branch arms; common-suffix merging must not duplicate them.
+    out = _token_output()
+    # transfer's success tail (emit Transfer + return 1) appears once per fn,
+    # not once per branch arm
+    body = re.search(r"function transfer\(address.*?\n    \}", out, re.S).group(0)
+    assert body.count("emit Transfer(") <= 1

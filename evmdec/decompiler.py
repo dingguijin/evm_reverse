@@ -126,42 +126,97 @@ def _is_loop_body(node: TraceNode) -> bool:
     return walk(node) and found[0]
 
 
-def _emit_node(node: TraceNode, out: list[str], depth: int) -> None:
-    pad = INDENT * depth
-    for stmt in node.stmts:
-        out.append(pad + render_stmt(stmt))
+# A function body is lowered to a "Block": a flat list of structured items,
+#   ("stmt", Stmt) | ("req", cond, revert) | ("if", cond, then, else) |
+#   ("while", cond, body)
+# where then/else/body are themselves Blocks. This explicit form (unlike the
+# raw TraceNode, whose branch is always last) lets us hoist statements that
+# come *after* a branch, which is what common-suffix merging needs.
+
+_MERGE_BUDGET = 6000
+
+
+def _to_block(node: TraceNode, budget: list[int]) -> list[tuple]:
+    items: list[tuple] = [("stmt", s) for s in node.stmts]
+    budget[0] -= len(node.stmts) + 1
     br = node.branch
-    if br is None:
-        return
-    # recovered loop: the arm whose every path jumps back is the body,
-    # the other arm is the code after the loop
+    if br is None or budget[0] <= 0:
+        return items
     t_loops, f_loops = _is_loop_body(br.true), _is_loop_body(br.false)
     if t_loops and not f_loops:
-        out.append(pad + f"while ({render(br.cond)}) {{")
-        _emit_node(br.true, out, depth + 1)
-        out.append(pad + "}")
-        _emit_node(br.false, out, depth)
-        return
+        items.append(("while", br.cond, _to_block(br.true, budget)))
+        return items + _to_block(br.false, budget)
     if f_loops and not t_loops:
-        out.append(pad + f"while ({render(negate(br.cond))}) {{")
-        _emit_node(br.false, out, depth + 1)
-        out.append(pad + "}")
-        _emit_node(br.true, out, depth)
-        return
+        items.append(("while", negate(br.cond), _to_block(br.false, budget)))
+        return items + _to_block(br.true, budget)
     if is_pure_revert(br.false):
-        out.append(pad + _require_line(br.cond, _first_revert(br.false)))
-        _emit_node(br.true, out, depth)
-        return
+        items.append(("req", br.cond, _first_revert(br.false)))
+        return items + _to_block(br.true, budget)
     if is_pure_revert(br.true):
-        out.append(pad + _require_line(negate(br.cond), _first_revert(br.true)))
-        _emit_node(br.false, out, depth)
-        return
-    out.append(pad + f"if ({render(br.cond)}) {{")
-    _emit_node(br.true, out, depth + 1)
-    if br.false.stmts or br.false.branch:
-        out.append(pad + "} else {")
-        _emit_node(br.false, out, depth + 1)
-    out.append(pad + "}")
+        items.append(("req", negate(br.cond), _first_revert(br.true)))
+        return items + _to_block(br.false, budget)
+    items.append(("if", br.cond,
+                  _to_block(br.true, budget), _to_block(br.false, budget)))
+    return items
+
+
+def _merge_tails(block: list[tuple]) -> list[tuple]:
+    """Hoist the common trailing items shared by an if's two arms out past the
+    if. Sound because symbolic execution already produced *identical* suffix
+    subtrees from each path's state — equal items compute the same thing."""
+    out: list[tuple] = []
+    for item in block:
+        if item[0] == "if":
+            _, cond, t, e = item
+            t, e = _merge_tails(t), _merge_tails(e)
+            k = 0
+            while k < len(t) and k < len(e) and t[-1 - k] == e[-1 - k]:
+                k += 1
+            suffix = t[len(t) - k:] if k else []
+            t, e = t[:len(t) - k], e[:len(e) - k]
+            if t or e:
+                out.append(("if", cond, t, e))
+            out += suffix
+        elif item[0] == "while":
+            out.append(("while", item[1], _merge_tails(item[2])))
+        else:
+            out.append(item)
+    return out
+
+
+def _render_block(block: list[tuple], out: list[str], depth: int) -> None:
+    pad = INDENT * depth
+    for item in block:
+        kind = item[0]
+        if kind == "stmt":
+            out.append(pad + render_stmt(item[1]))
+        elif kind == "req":
+            out.append(pad + _require_line(item[1], item[2]))
+        elif kind == "while":
+            out.append(pad + f"while ({render(item[1])}) {{")
+            _render_block(item[2], out, depth + 1)
+            out.append(pad + "}")
+        else:  # if
+            _, cond, t, e = item
+            if not t and e:                          # invert an empty then-arm
+                out.append(pad + f"if ({render(negate(cond))}) {{")
+                _render_block(e, out, depth + 1)
+                out.append(pad + "}")
+            else:
+                out.append(pad + f"if ({render(cond)}) {{")
+                _render_block(t, out, depth + 1)
+                if e:
+                    out.append(pad + "} else {")
+                    _render_block(e, out, depth + 1)
+                out.append(pad + "}")
+
+
+def _emit_node(node: TraceNode, out: list[str], depth: int) -> None:
+    budget = [_MERGE_BUDGET]
+    block = _to_block(node, budget)
+    if budget[0] > 0:                                # small enough to merge
+        block = _merge_tails(block)
+    _render_block(block, out, depth)
 
 
 # ---------------------------------------------------------------- analysis
