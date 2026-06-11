@@ -85,7 +85,14 @@ Two pinned fixtures (solc 0.8.26 bin-runtime; tests assert exact offsets/selecto
 - `decompiler.py` — **M5b.** `decompile(code)`: walks the dispatcher spine of the trace
   tree (selector-EQ branch -> function body; pure-revert arm -> `require(...)`), emits
   per-function pseudocode with mutability inference (view/pure) and a storage-layout
-  summary (const slots + mapping base slots from `SHA3(key, slot)`).
+  summary (const slots + mapping base slots from `SHA3(key, slot)`). Per function it also
+  runs **CSE naming** (`_cse_bindings`): sub-expressions used 2+ times that are
+  *function-invariant* (read only state the function never writes, nothing call-volatile
+  after a call) are hoisted to `vN = <expr>;` bindings and `ir.set_cse_names` makes
+  `render` substitute the name. Soundness rests on invariance — a value that can't change
+  is safe to name once; mutated mappings/slots are deliberately left inline. Bounded by
+  `_CSE_BUDGET` subexpression visits (recursive Sym hashing is O(size^2)); huge functions
+  skip CSE entirely.
 
 ## Milestone status
 
@@ -94,8 +101,9 @@ M5 decompile). Known limitations / future work:
 - loops render as `while` via widening, but loop bodies show only *effect* statements —
   pure stack arithmetic (accumulators) is invisible until SSA-style assignments exist,
   so e.g. a sum loop shows `while (i1 <= arg0) { continue; }` with the accumulation implicit;
-- no SSA — expressions are re-rendered at each use, so repeated `storage[keccak(...)]`
-  reads are verbose (no common-subexpression naming);
+- CSE names only *function-invariant* repeats; values that change (a mutated balance
+  read before vs after its SSTORE) are still re-rendered inline — full SSA with
+  span-scoped naming would dedup those too;
 - function return types are unknown (4byte signatures don't carry them);
 - dynamic types (string/bytes/arrays in calldata) decode as raw word arithmetic.
 

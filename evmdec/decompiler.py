@@ -15,7 +15,10 @@ Function names and parameter types come from M3's selector recovery.
 
 from __future__ import annotations
 
-from .ir import negate, render, render_revert, render_stmt, revert_annotation
+from .ir import (
+    negate, render, render_def, render_revert, render_stmt, revert_annotation,
+    set_cse_names,
+)
 from .selectors import find_functions
 from .symbolic import (
     Branch, Call, Comment, Const, Create, Expr, Log, LoopBack, Return, Revert,
@@ -242,6 +245,161 @@ def _analyze(node: TraceNode, acc: _Analysis | None = None) -> _Analysis:
     return acc
 
 
+# ---------------------------------------------------------------- CSE naming
+
+# Reading these means a value can change across an external call, so it is not
+# invariant once the function makes any call.
+_CALL_VOLATILE = {"BALANCE", "SELFBALANCE", "EXTCODESIZE", "EXTCODEHASH",
+                  "EXTCODEHASH", "RETURNDATA", "CALLRET"}
+# Naming these adds nothing (already short / unique) or is unsafe to hoist.
+_CSE_SKIP_OPS = {"CALLDATALOAD", "LOOPVAR", "STACK_IN", "HUGE", "SHA3", "SHA3RAW"}
+
+
+def _mapping_base(slot: Sym) -> int | None:
+    """Base storage slot of a mapping access keccak256(key, base), else None."""
+    if (isinstance(slot, Expr) and slot.op == "SHA3" and len(slot.args) == 2
+            and isinstance(slot.args[1], Const)):
+        return slot.args[1].value
+    return None
+
+
+def _written_state(node: TraceNode):
+    """(written const slots, written mapping bases, unknown_write, has_call)."""
+    slots: set[int] = set()
+    maps: set[int] = set()
+    flags = {"unknown": False, "call": False}
+
+    def visit(n: TraceNode) -> None:
+        for s in n.stmts:
+            if isinstance(s, SStore):
+                if isinstance(s.slot, Const):
+                    slots.add(s.slot.value)
+                elif (base := _mapping_base(s.slot)) is not None:
+                    maps.add(base)
+                else:
+                    flags["unknown"] = True
+            elif isinstance(s, (TStore, Call, Create, SelfDestruct)):
+                flags["call"] = True
+        if n.branch:
+            visit(n.branch.true)
+            visit(n.branch.false)
+
+    visit(node)
+    return slots, maps, flags["unknown"], flags["call"]
+
+
+def _invariant(sym: Sym, wslots: set[int], wmaps: set[int],
+               unknown: bool, has_call: bool) -> bool:
+    """True if `sym` evaluates to the same value throughout the function: it
+    reads no state that the function (might) write, and nothing call-volatile
+    once a call has happened."""
+    ok = True
+
+    def walk(s: Sym) -> None:
+        nonlocal ok
+        if not ok or not isinstance(s, Expr):
+            return
+        op = s.op
+        if op in ("SLOAD", "TLOAD"):
+            if op == "TLOAD" or unknown:
+                ok = False
+            elif isinstance(s.args[0], Const):
+                if s.args[0].value in wslots:
+                    ok = False
+            else:
+                base = _mapping_base(s.args[0])
+                if base is None or base in wmaps:
+                    ok = False
+        elif op in _CALL_VOLATILE and has_call:
+            ok = False
+        for a in s.args:
+            walk(a)
+
+    walk(sym)
+    return ok
+
+
+def _size(sym: Sym) -> int:
+    return 1 + sum(_size(a) for a in sym.args) if isinstance(sym, Expr) else 1
+
+
+def _contains(outer: Sym, inner: Sym) -> bool:
+    return isinstance(outer, Expr) and any(
+        a == inner or _contains(a, inner) for a in outer.args)
+
+
+# Bound on subexpression visits per function. Beyond this the function is huge
+# (path-exploded / pathological) — skip CSE: recursive Sym hashing makes the
+# counting pass O(size^2), and verbose pseudocode there is not the win anyway.
+_CSE_BUDGET = 15000
+
+
+def _cse_bindings(node: TraceNode, guards):
+    """Pick invariant sub-expressions used 2+ times and worth naming; return
+    (ordered [(name, def_text)], names map for ir.render)."""
+    counts: dict[Sym, int] = {}
+    budget = [_CSE_BUDGET]
+
+    def count(sym: Sym) -> None:
+        if budget[0] <= 0 or not isinstance(sym, Expr):
+            return
+        budget[0] -= 1
+        counts[sym] = counts.get(sym, 0) + 1
+        for a in sym.args:
+            count(a)
+
+    def visit(n: TraceNode) -> None:
+        for s in n.stmts:
+            for v in s.__dict__.values():
+                if isinstance(v, Sym):
+                    count(v)
+                elif isinstance(v, list):
+                    for x in v:
+                        if isinstance(x, Sym):
+                            count(x)
+        if n.branch and budget[0] > 0:
+            count(n.branch.cond)
+            visit(n.branch.true)
+            visit(n.branch.false)
+
+    for cond, _ in guards:
+        count(cond)
+    visit(node)
+    if budget[0] <= 0:                          # too big: don't name anything
+        set_cse_names({})
+        return [], {}
+
+    wslots, wmaps, unknown, has_call = _written_state(node)
+    cand = []
+    for sym, c in counts.items():
+        if c < 2 or sym.op in _CSE_SKIP_OPS or _size(sym) < 3:
+            continue
+        if not _invariant(sym, wslots, wmaps, unknown, has_call):
+            continue
+        if len(render_def(sym)) < 16:        # too cheap to bother naming
+            continue
+        cand.append(sym)
+
+    # Bound the O(n^2) containment pass: keep the most-repeated candidates.
+    cand.sort(key=lambda s: counts[s], reverse=True)
+    cand = cand[:200]
+
+    # Drop a candidate fully absorbed by a larger one (same occurrence count and
+    # always nested inside it): naming it would just add a redundant line.
+    kept = []
+    for sym in cand:
+        parent_max = max((counts[o] for o in cand
+                          if o is not sym and _contains(o, sym)), default=0)
+        if counts[sym] > parent_max:
+            kept.append(sym)
+
+    kept.sort(key=_size)                      # define smaller (inner) names first
+    names = {sym: f"v{i}" for i, sym in enumerate(kept)}
+    set_cse_names(names)                       # so render_def substitutes nested names
+    bindings = [(names[sym], render_def(sym)) for sym in kept]
+    return bindings, names
+
+
 # ---------------------------------------------------------------- top level
 
 def _signature_header(selector: int, signature: str | None) -> str:
@@ -293,15 +451,20 @@ def decompile(code: bytes) -> str:
         fn = known.get(selector)
         header = _signature_header(selector, fn.signature if fn else None)
         lines.append(f"{INDENT}{header}{mutability} {{  // selector 0x{selector:08x}")
+        bindings, _ = _cse_bindings(body, guards)
+        for name, defn in bindings:
+            lines.append(INDENT * 2 + f"{name} = {defn};")
         for cond, rev in guards:
             lines.append(INDENT * 2 + _require_line(cond, rev))
         _emit_node(body, lines, 2)
+        set_cse_names({})
         lines.append(f"{INDENT}}}")
         lines.append("")
 
     if fallbacks:
         lines.append(f"{INDENT}fallback() external payable {{")
         for fb in fallbacks:
+            set_cse_names({})
             _emit_node(fb, lines, 2)
         lines.append(f"{INDENT}}}")
         lines.append("")

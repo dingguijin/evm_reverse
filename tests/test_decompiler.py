@@ -1,4 +1,5 @@
 import os
+import re
 
 from evmdec.decompiler import decompile
 from evmdec.disassembler import from_hex
@@ -87,3 +88,16 @@ def test_shifted_dispatcher_selector_named():
         out = decompile(from_hex(f.read()))
     assert "function upgradeToAndCall(address arg0, bytes arg1) public" in out
     assert "// selector 0x4f1ef286" in out
+
+
+def test_cse_names_repeated_invariants():
+    # WETH's name()/symbol() unpack the same string-length expression many
+    # times; CSE must hoist it to a `vN = ...;` binding and reuse the name.
+    path = os.path.join(os.path.dirname(__file__), "weth.bin")
+    with open(path) as f:
+        out = decompile(from_hex(f.read()))
+    defs = re.findall(r"^ *(v\d+) = .+;$", out, re.M)
+    assert defs, "expected at least one CSE binding"
+    for name in defs:
+        uses = len(re.findall(rf"\b{name}\b", out))
+        assert uses >= 2, f"{name} defined but never reused ({uses} occurrence)"

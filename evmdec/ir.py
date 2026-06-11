@@ -75,7 +75,31 @@ def _is_msg_sig(sym: Sym) -> bool:
     )
 
 
+# Active common-subexpression names for the function currently being rendered.
+# Set by the decompiler around each function body; render() substitutes a name
+# for any sub-expression bound to one. Single-threaded by design.
+_CSE_NAMES: dict[Sym, str] = {}
+
+
+def set_cse_names(names: dict[Sym, str]) -> None:
+    global _CSE_NAMES
+    _CSE_NAMES = names
+
+
+def render_def(sym: Sym) -> str:
+    """Render a CSE binding's right-hand side: substitute *other* names but not
+    this expression's own name (which would make `v0 = v0;`)."""
+    return _render(sym)
+
+
 def render(sym: Sym) -> str:
+    name = _CSE_NAMES.get(sym)
+    if name is not None:
+        return name
+    return _render(sym)
+
+
+def _render(sym: Sym) -> str:
     if isinstance(sym, Const):
         v = sym.value
         return str(v) if v < 4096 else f"0x{v:x}"
