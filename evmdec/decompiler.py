@@ -190,6 +190,8 @@ def _render_block(block: list[tuple], out: list[str], depth: int) -> None:
         kind = item[0]
         if kind == "stmt":
             out.append(pad + render_stmt(item[1]))
+        elif kind == "let":
+            out.append(pad + f"s{item[1]} = {render(item[2])};")
         elif kind == "req":
             out.append(pad + _require_line(item[1], item[2]))
         elif kind == "while":
@@ -211,11 +213,186 @@ def _render_block(block: list[tuple], out: list[str], depth: int) -> None:
                 out.append(pad + "}")
 
 
+# ---------------------------------------------------------------- span-local SSA
+
+def _subst(sym: Sym, target: Sym, repl: Sym) -> Sym:
+    """Replace every occurrence of `target` in `sym` with `repl`."""
+    if sym == target:
+        return repl
+    if isinstance(sym, Expr):
+        new = tuple(_subst(a, target, repl) for a in sym.args)
+        if new != sym.args:
+            return Expr(sym.op, new)
+    return sym
+
+
+def _item_syms(item: tuple):
+    """Yield each top-level Sym carried by a stmt/req item."""
+    if item[0] == "req":
+        yield item[1]
+    elif item[0] == "stmt":
+        for v in item[1].__dict__.values():
+            if isinstance(v, Sym):
+                yield v
+            elif isinstance(v, list):
+                for x in v:
+                    if isinstance(x, Sym):
+                        yield x
+
+
+def _reads_state(sym: Sym) -> set:
+    """Storage keys a value reads; {'*'} means call-volatile / unknown."""
+    keys: set = set()
+
+    def walk(s: Sym) -> None:
+        if isinstance(s, Expr):
+            if s.op in ("SLOAD", "TLOAD"):
+                k = _slot_key(s)
+                keys.add(k if k is not None else "*")
+            elif s.op in ("CALLRET", "RETURNDATA", "BALANCE", "SELFBALANCE"):
+                keys.add("*")
+            for a in s.args:
+                walk(a)
+
+    walk(sym)
+    return keys
+
+
+def _writes(item: tuple) -> set:
+    """Storage keys a single block item may write; {'*'} = call / unknown."""
+    if item[0] != "stmt":
+        return set()
+    s = item[1]
+    if isinstance(s, (Call, Create, SelfDestruct)):
+        return {"*"}
+    if isinstance(s, (SStore, TStore)):
+        if isinstance(s.slot, Const):
+            return {s.slot.value}
+        base = _mapping_base(s.slot)
+        return {("m", base)} if base is not None else {"*"}
+    return set()
+
+
+def _writes_any(item: tuple, keys: set) -> bool:
+    w = _writes(item)
+    return bool(w) and ("*" in w or "*" in keys or bool(w & keys))
+
+
+def _name_run(run: list[tuple], counter: list[int]) -> list[tuple]:
+    """Span-local CSE over a straight-line run of stmt/req items: name a value
+    read 2+ times whose inputs cannot change between first and last use."""
+    if len(run) > 400:                               # O(cand*items): skip giants
+        return run
+    counts: dict[Sym, int] = {}
+
+    def tally(s: Sym) -> None:
+        if isinstance(s, Expr):
+            counts[s] = counts.get(s, 0) + 1
+            for a in s.args:
+                tally(a)
+
+    for item in run:
+        for sym in _item_syms(item):
+            tally(sym)
+
+    # candidates: repeated, non-trivial, reading mutable state (pure repeats are
+    # already handled by function-invariant CSE)
+    # read mutable state (pure repeats are handled by function-invariant CSE);
+    # unknown keys ("*") are fine — the span rule below treats any write as
+    # invalidating, so a value is only named while provably stable
+    cand = [s for s, c in counts.items()
+            if c >= 2 and _size(s) >= 3 and s.op not in _CSE_SKIP_OPS
+            and _reads_state(s)]
+    cand.sort(key=lambda s: (counts[s], _size(s)), reverse=True)
+    cand = cand[:60]                                 # bound the O(n^2) work below
+    cand = [s for s in cand
+            if not any(o is not s and _contains(o, s) for o in cand)]  # no nesting
+
+    occ_cache: dict[Sym, list[int]] = {}
+    for s in cand:
+        occ_cache[s] = [i for i, it in enumerate(run)
+                        if any(_contains_or_eq(v, s) for v in _item_syms(it))]
+
+    bindings_at: dict[int, list[tuple]] = {}
+    for s in cand:
+        occ = occ_cache[s]
+        if len(occ) < 2:
+            continue
+        keys = _reads_state(s)
+        # the value must not change between the first and last use: no write to
+        # its keys may happen strictly before a later read of it
+        first, last = occ[0], occ[-1]
+        w = next((i for i in range(first, len(run)) if _writes_any(run[i], keys)), None)
+        if w is not None and w < last:
+            continue                                 # written, then read again
+        name = Expr("LOCAL", (Const(counter[0]),))
+        counter[0] += 1
+        for i in range(first, last + 1):
+            run[i] = _subst_item(run[i], s, name)
+        bindings_at.setdefault(first, []).append(("let", name.args[0].value, s))
+
+    out: list[tuple] = []
+    for i, item in enumerate(run):
+        out.extend(bindings_at.get(i, []))
+        out.append(item)
+    return out
+
+
+def _contains_or_eq(sym: Sym, target: Sym) -> bool:
+    return sym == target or _contains(sym, target)
+
+
+def _subst_item(item: tuple, target: Sym, repl: Sym) -> tuple:
+    if item[0] == "req":
+        return ("req", _subst(item[1], target, repl), item[2])
+    if item[0] == "stmt":
+        st = item[1]
+        kw = {}
+        for f, v in st.__dict__.items():
+            if isinstance(v, Sym):
+                kw[f] = _subst(v, target, repl)
+            elif isinstance(v, list):
+                kw[f] = [_subst(x, target, repl) if isinstance(x, Sym) else x
+                         for x in v]
+            else:
+                kw[f] = v
+        return ("stmt", type(st)(**kw))
+    return item
+
+
+def _name_locals(block: list[tuple], counter: list[int]) -> list[tuple]:
+    """Apply span-local naming to maximal straight-line runs, recursing into
+    if/while blocks."""
+    out: list[tuple] = []
+    run: list[tuple] = []
+
+    def flush() -> None:
+        if run:
+            out.extend(_name_run(run, counter))
+            run.clear()
+
+    for item in block:
+        if item[0] in ("stmt", "req"):
+            run.append(item)
+        elif item[0] == "if":
+            flush()
+            out.append(("if", item[1], _name_locals(item[2], counter),
+                        _name_locals(item[3], counter)))
+        elif item[0] == "while":
+            flush()
+            out.append(("while", item[1], _name_locals(item[2], counter)))
+        else:
+            flush()
+            out.append(item)
+    flush()
+    return out
+
+
 def _emit_node(node: TraceNode, out: list[str], depth: int) -> None:
     budget = [_MERGE_BUDGET]
     block = _to_block(node, budget)
-    if budget[0] > 0:                                # small enough to merge
-        block = _merge_tails(block)
+    if budget[0] > 0:                                # small enough to merge / name
+        block = _name_locals(_merge_tails(block), [0])
     _render_block(block, out, depth)
 
 

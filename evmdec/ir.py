@@ -245,6 +245,8 @@ def _render(sym: Sym) -> str:
         return f"success{args[0].value}"
     if op == "LOOPVAR":
         return f"i{args[0].value}"
+    if op == "LOCAL":
+        return f"s{args[0].value}"
     if op == "RETURNDATA":
         if len(args) == 2 and args[1].value:
             return f"returndata{args[0].value}[0x{args[1].value:x}]"

@@ -92,7 +92,15 @@ Two pinned fixtures (solc 0.8.26 bin-runtime; tests assert exact offsets/selecto
   `render` substitute the name. Soundness rests on invariance — a value that can't change
   is safe to name once; mutated mappings/slots are deliberately left inline. Bounded by
   `_CSE_BUDGET` subexpression visits (recursive Sym hashing is O(size^2)); huge functions
-  skip CSE entirely.
+  skip CSE entirely. The body is then lowered to a **Block IR** (stmt/req/if/while items
+  with sub-blocks): `_merge_tails` hoists the common suffix shared by an if's two arms out
+  past the if (sound because the suffix subtrees are *structurally identical* across arms —
+  symbolic execution proved they compute the same thing), collapsing path-fork duplication;
+  `_name_locals` then does **span-local SSA** — within a straight-line run it names a value
+  read 2+ times as `sN` for the span between its first use and the first write to state it
+  reads (so it is only named while provably stable; read-modify-write works because the
+  store is the last use). Both are bounded; span-local naming is checked corpus-wide for
+  scope soundness (no use-before-def / scope leak).
 
 ## Milestone status
 
@@ -101,9 +109,10 @@ M5 decompile). Known limitations / future work:
 - loops render as `while` via widening, but loop bodies show only *effect* statements —
   pure stack arithmetic (accumulators) is invisible until SSA-style assignments exist,
   so e.g. a sum loop shows `while (i1 <= arg0) { continue; }` with the accumulation implicit;
-- CSE names only *function-invariant* repeats; values that change (a mutated balance
-  read before vs after its SSTORE) are still re-rendered inline — full SSA with
-  span-scoped naming would dedup those too;
+- repeated values are named: function-invariant repeats as `vN` (CSE), and span-local
+  repeats (incl. read-modify-write of mutable storage) as `sN`; branch arms' common tails
+  are merged. Not yet: merging shared tails that aren't structurally identical, and
+  cross-block value naming;
 - return types are *inferred* (`_infer_return_type` in decompiler.py) — `returns (...)`
   is emitted from how each function builds its value: address/bool/narrow-uint masks,
   address literals (160-bit constants), dynamic memory ranges (bytes/string, which are

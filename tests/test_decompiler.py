@@ -135,3 +135,44 @@ def test_common_suffix_merged():
     # not once per branch arm
     body = re.search(r"function transfer\(address.*?\n    \}", out, re.S).group(0)
     assert body.count("emit Transfer(") <= 1
+
+
+def _assert_names_well_scoped(out):
+    """Every sN/vN use must be preceded by its definition within an enclosing
+    brace scope — catches span-local SSA / CSE scope leaks."""
+    import re as _re
+    defined = [set()]            # stack of scopes
+    for line in out.split("\n"):
+        s = line.strip()
+        opens = s.count("{") - s.count("}")
+        # check uses on this line against everything defined in scope
+        m = _re.match(r"([sv]\d+) = ", s)
+        for use in _re.findall(r"\b([sv]\d+)\b", s):
+            if m and use == m.group(1):
+                continue         # the definition itself
+            assert any(use in scope for scope in defined), \
+                f"{use} used before definition: {s!r}"
+        if m:
+            defined[-1].add(m.group(1))
+        if s.endswith("{"):
+            defined.append(set())
+        elif s == "}" and len(defined) > 1:
+            defined.pop()
+
+
+def test_span_local_ssa_allowance():
+    # WETH transferFrom's nested-mapping allowance read (allowance[from][sender])
+    # is read 3x in the spend path; span-local SSA names it once as sN.
+    path = os.path.join(os.path.dirname(__file__), "weth.bin")
+    with open(path) as f:
+        out = decompile(from_hex(f.read()))
+    body = re.search(r"function transferFrom.*?\n    \}", out, re.S).group(0)
+    assert re.search(r"s\d+ = storage\[keccak256\(msg.sender,", body)
+    _assert_names_well_scoped(out)
+
+
+def test_all_fixture_names_well_scoped():
+    for fx in ("weth.bin", "token.bin", "storage.bin", "proxy_shifted.bin"):
+        path = os.path.join(os.path.dirname(__file__), fx)
+        with open(path) as f:
+            _assert_names_well_scoped(decompile(from_hex(f.read())))
