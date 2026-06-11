@@ -80,10 +80,73 @@ def _is_msg_sig(sym: Sym) -> bool:
 # for any sub-expression bound to one. Single-threaded by design.
 _CSE_NAMES: dict[Sym, str] = {}
 
+# Indices of the current function's dynamic (bytes/string/array) parameters,
+# so ABI head/tail calldata math renders as arg{i}.length / arg{i}[k].
+_DYN_PARAMS: dict[int, str] = {}
+
 
 def set_cse_names(names: dict[Sym, str]) -> None:
     global _CSE_NAMES
     _CSE_NAMES = names
+
+
+def set_dyn_params(params: dict[int, str]) -> None:
+    global _DYN_PARAMS
+    _DYN_PARAMS = params
+
+
+def _flatten_add(sym: Sym) -> tuple[int, list[Sym]]:
+    """Sum the constant terms of a (possibly nested) ADD, returning
+    (constant_total, non-constant terms)."""
+    if isinstance(sym, Const):
+        return sym.value, []
+    if isinstance(sym, Expr) and sym.op == "ADD":
+        const = 0
+        terms: list[Sym] = []
+        for a in sym.args:
+            c, t = _flatten_add(a)
+            const += c
+            terms += t
+        return const, terms
+    return 0, [sym]
+
+
+def _arg_index(sym: Sym) -> int | None:
+    """If sym is the calldata head word of arg{i} (CALLDATALOAD(4+32i)), give i."""
+    if (isinstance(sym, Expr) and sym.op == "CALLDATALOAD"
+            and isinstance(sym.args[0], Const)):
+        off = sym.args[0].value
+        if off >= 4 and (off - 4) % 32 == 0:
+            return (off - 4) // 32
+    return None
+
+
+def _dyn_calldata(off: Sym) -> str | None:
+    """Render an offset into a dynamic param's tail as arg{i}.length / arg{i}[k].
+
+    A dynamic arg's data region starts at `4 + <head word>`; the first word
+    there is its length, and element/byte data follows 32 bytes later."""
+    const, terms = _flatten_add(off)
+    heads = [t for t in terms if _arg_index(t) in _DYN_PARAMS]
+    if len(heads) != 1:
+        return None
+    i = _arg_index(heads[0])
+    others = [t for t in terms if t is not heads[0]]
+    rel = const - 4                                  # offset within the tail
+    if not others:
+        if rel == 0:
+            return f"arg{i}.length"
+        if rel >= 32 and (rel - 32) % 32 == 0:
+            return f"arg{i}[{(rel - 32) // 32}]"
+        if rel > 0:
+            return f"arg{i}.data[{rel - 32}]"
+    elif rel == 32 and len(others) == 1:             # arg{i}[<symbolic index>]
+        o = others[0]
+        if isinstance(o, Expr) and o.op == "MUL" and len(o.args) == 2:
+            for c, x in (o.args, o.args[::-1]):
+                if isinstance(c, Const) and c.value == 32:
+                    return f"arg{i}[{render(x)}]"
+    return None
 
 
 def render_def(sym: Sym) -> str:
@@ -119,6 +182,9 @@ def _render(sym: Sym) -> str:
             if off.value >= 4 and (off.value - 4) % 32 == 0:
                 return f"arg{(off.value - 4) // 32}"
             return f"calldata[{render(off)}]"
+        dyn = _dyn_calldata(off)
+        if dyn is not None:
+            return dyn
         return f"calldata[{render(off)}]"
 
     if op == "SLOAD":

@@ -115,3 +115,13 @@ def test_return_types_inferred():
     assert "function decimals() public view returns (uint8)" in out
     assert "function name() public view returns (bytes)" in out          # string≡bytes
     assert re.search(r"function withdraw\([^)]*\) public\b(?! returns)", out)
+
+
+def test_dynamic_calldata_length():
+    # OZ proxy's upgradeToAndCall(address,bytes): the bytes param's ABI length
+    # word (calldata[4 + offset]) must render as arg1.length, not raw math.
+    path = os.path.join(os.path.dirname(__file__), "proxy_shifted.bin")
+    with open(path) as f:
+        out = decompile(from_hex(f.read()))
+    assert "arg1.length" in out
+    assert "calldata[(4 + arg1)]" not in out

@@ -112,7 +112,10 @@ M5 decompile). Known limitations / future work:
   *class* granularity vs solc ABI outputs: ~86% scalar match, ~92% void
   (`scripts/verify_returns.py`). Still unrecoverable: narrow-uint/bool read from a slot
   set only in the constructor (no runtime mask to learn from), and signedness;
-- dynamic types (string/bytes/arrays in calldata) decode as raw word arithmetic.
+- dynamic calldata params (bytes/string/T[]) recover `arg{i}.length` and `arg{i}[k]`
+  (`_dyn_calldata` in ir.py, driven by `_dynamic_params` from the recovered signature);
+  the raw ABI offset word and data-region copies still show as offset arithmetic, and
+  unnamed functions get no param types so no decode.
 
 When extending: keep each layer pure and independently testable, add a CLI subcommand
 and a `tests/test_<layer>.py` pinned to the fixtures, and run the full suite.

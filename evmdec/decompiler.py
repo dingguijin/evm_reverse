@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from .ir import (
     negate, render, render_def, render_revert, render_stmt, revert_annotation,
-    set_cse_names,
+    set_cse_names, set_dyn_params,
 )
 from .selectors import find_functions
 from .symbolic import (
@@ -587,11 +587,43 @@ def _cse_bindings(node: TraceNode, guards):
 
 # ---------------------------------------------------------------- top level
 
+def _split_params(params: str) -> list[str]:
+    """Split a signature's parameter list on top-level commas (tuples nest)."""
+    out, depth, cur = [], 0, ""
+    for ch in params:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    if cur:
+        out.append(cur)
+    return [t for t in out if t]
+
+
+def _dynamic_params(signature: str | None) -> dict[int, str]:
+    """Indices of dynamic (variable-length) params: bytes/string/T[]."""
+    if not signature:
+        return {}
+    params = signature.partition("(")[2].rstrip(")")
+    dyn = {}
+    for i, t in enumerate(_split_params(params)):
+        t = t.strip()
+        if t in ("bytes", "string"):
+            dyn[i] = "bytes"
+        elif t.endswith("[]"):
+            dyn[i] = "array"
+    return dyn
+
+
 def _signature_header(selector: int, signature: str | None) -> str:
     if signature:
         name, _, params = signature.partition("(")
-        params = params.rstrip(")")
-        types = [t for t in params.split(",") if t]
+        types = _split_params(params.rstrip(")"))
         args = ", ".join(f"{t} arg{i}" for i, t in enumerate(types))
         return f"function {name}({args}) public"
     return f"function func_{selector:08x}() public"
@@ -637,7 +669,9 @@ def decompile(code: bytes) -> str:
 
     for selector, body, guards, mutability in fn_render:
         fn = known.get(selector)
-        header = _signature_header(selector, fn.signature if fn else None)
+        sig = fn.signature if fn else None
+        header = _signature_header(selector, sig)
+        set_dyn_params(_dynamic_params(sig))         # arg{i}.length / arg{i}[k]
         ret = _infer_return_type(body, slot_types)
         ret_clause = f" returns ({ret})" if ret else ""
         lines.append(f"{INDENT}{header}{mutability}{ret_clause} {{  "
@@ -649,6 +683,7 @@ def decompile(code: bytes) -> str:
             lines.append(INDENT * 2 + _require_line(cond, rev))
         _emit_node(body, lines, 2)
         set_cse_names({})
+        set_dyn_params({})
         lines.append(f"{INDENT}}}")
         lines.append("")
 
@@ -656,6 +691,7 @@ def decompile(code: bytes) -> str:
         lines.append(f"{INDENT}fallback() external payable {{")
         for fb in fallbacks:
             set_cse_names({})
+            set_dyn_params({})
             _emit_node(fb, lines, 2)
         lines.append(f"{INDENT}}}")
         lines.append("")
