@@ -71,10 +71,12 @@ def test_transfer_event_named():
     assert "emit Transfer(msg.sender, arg0, arg1);" in out
 
 
-def test_loop_truncated_not_hung():
+def test_loop_recovered_as_while():
     out = _token_output()
-    # sumTo()'s for-loop is unrolled by path execution and then cut off
-    assert "truncated" in out
+    # sumTo()'s for-loop is widened after one concrete iteration and rendered
+    # as a while over fresh loop variables — no unroll-and-truncate
+    assert "while (" in out
+    assert "truncated" not in out
 
 
 def test_shifted_dispatcher_selector_named():

@@ -278,6 +278,17 @@ class Comment(Stmt):
     text: str
 
 
+@dataclass
+class LoopBack(Stmt):
+    """Back-edge of a recovered loop: jump to `header` after a widened pass.
+
+    Emitted instead of unrolling further once the loop body has executed once
+    with widened (fresh symbolic) induction state; the renderer turns the
+    enclosing branch into a `while`.
+    """
+    header: int
+
+
 # ---------------------------------------------------------------- trace tree
 
 @dataclass
@@ -326,6 +337,68 @@ class SymExec:
     def run(self, start: int = 0, stack: list[Sym] | None = None) -> TraceNode:
         self._deadline = time.monotonic() + self.max_seconds
         return self._explore(start, list(stack or []), {}, {}, {})
+
+    # -- loop / revisit accounting ------------------------------------------
+
+    def _enter_block(self, visits: dict, dest: int,
+                     stack: list[Sym], memory: dict) -> str | None:
+        """Account for entering block `dest`; possibly widen or end a loop.
+
+        Revisits are counted per (dest, call-site fingerprint) — the nearest
+        return-address constants on the stack — so an internal helper entered
+        from many call sites along one path (e.g. per-argument calldata
+        decoders) is not mistaken for a loop: each call site pushes a
+        different return address.
+
+        Genuine loops (same fingerprint) are *widened*, not unrolled: on the
+        second entry every stack slot / memory word that changed since the
+        first entry becomes a fresh loop variable, the body runs once more on
+        that generalized state, and the third entry returns "loopback" so the
+        renderer can close a `while`. Irregular revisits (stack shape changed)
+        fall back to counting and return "cut" at max_block_visits; a loose
+        per-dest total bounds pathological fingerprint churn.
+        """
+        ctx: tuple[int, ...] = ()
+        for s in reversed(stack[-8:]):
+            if isinstance(s, Const) and s.value in self.jumpdests:
+                ctx += (s.value,)
+                if len(ctx) == 2:
+                    break
+        key = (dest, ctx)
+        n = visits[key] = visits.get(key, 0) + 1
+        visits[dest] = visits.get(dest, 0) + 1
+        if visits[dest] > self.max_block_visits * 8:
+            return "cut"
+        if n == 1:
+            visits[("snap", key)] = (list(stack), dict(memory))
+            return None
+        if n == 2:
+            snap_stack, snap_mem = visits.get(("snap", key), (None, None))
+            diffs = []
+            if snap_stack is not None and len(snap_stack) == len(stack):
+                for i, (old, new) in enumerate(zip(snap_stack, stack)):
+                    if old == new:
+                        continue
+                    if any(isinstance(v, Const) and v.value in self.jumpdests
+                           for v in (old, new)):
+                        # a return address changed: different call sites the
+                        # fingerprint missed, not a loop — don't widen
+                        diffs = None
+                        break
+                    diffs.append(i)
+            if diffs is not None and snap_stack is not None \
+                    and len(snap_stack) == len(stack):
+                for i in diffs:              # induction values: generalize
+                    self._fresh += 1
+                    stack[i] = Expr("LOOPVAR", (Const(self._fresh),))
+                for k in list(memory):
+                    if snap_mem.get(k) != memory[k]:
+                        del memory[k]        # changed per iteration: forget
+                visits[("widened", key)] = True
+            return None                      # irregular shape: keep unrolling
+        if visits.get(("widened", key)):
+            return "loopback"
+        return "cut" if n > self.max_block_visits else None
 
     # -- path-condition memory --------------------------------------------
 
@@ -432,9 +505,12 @@ class SymExec:
                 dest = self._pop(stack)
                 if isinstance(dest, Const) and dest.value in self.jumpdests:
                     self.resolved.setdefault(ins.offset, set()).add(dest.value)
-                    visits[dest.value] = visits.get(dest.value, 0) + 1
-                    if visits[dest.value] > self.max_block_visits:
+                    act = self._enter_block(visits, dest.value, stack, memory)
+                    if act == "cut":
                         node.stmts.append(Comment(f"loop back to 0x{dest.value:x} truncated"))
+                        return node
+                    if act == "loopback":
+                        node.stmts.append(LoopBack(dest.value))
                         return node
                     idx = self.by_offset[dest.value]
                     continue
@@ -454,9 +530,12 @@ class SymExec:
                         continue
                     if isinstance(dest, Const) and dest.value in self.jumpdests:
                         self.resolved.setdefault(ins.offset, set()).add(dest.value)
-                        visits[dest.value] = visits.get(dest.value, 0) + 1
-                        if visits[dest.value] > self.max_block_visits:
+                        act = self._enter_block(visits, dest.value, stack, memory)
+                        if act == "cut":
                             node.stmts.append(Comment(f"loop back to 0x{dest.value:x} truncated"))
+                            return node
+                        if act == "loopback":
+                            node.stmts.append(LoopBack(dest.value))
                             return node
                         idx = self.by_offset[dest.value]
                         continue
@@ -466,12 +545,15 @@ class SymExec:
                 if isinstance(dest, Const) and dest.value in self.jumpdests:
                     self.resolved.setdefault(ins.offset, set()).add(dest.value)
                     t_visits = dict(visits)
-                    t_visits[dest.value] = t_visits.get(dest.value, 0) + 1
+                    t_stack, t_mem = list(stack), dict(memory)
                     t_asm, f_asm = self._fork_assumptions(cond, assumptions)
-                    if t_visits[dest.value] > self.max_block_visits:
+                    act = self._enter_block(t_visits, dest.value, t_stack, t_mem)
+                    if act == "cut":
                         true_node = TraceNode([Comment(f"loop back to 0x{dest.value:x} truncated")])
+                    elif act == "loopback":
+                        true_node = TraceNode([LoopBack(dest.value)])
                     else:
-                        true_node = self._explore(dest.value, list(stack), dict(memory), t_visits, t_asm)
+                        true_node = self._explore(dest.value, t_stack, t_mem, t_visits, t_asm)
                     false_node = self._explore(ins.next_offset, list(stack), dict(memory), dict(visits), f_asm)
                     node.branch = Branch(cond, true_node, false_node)
                     return node

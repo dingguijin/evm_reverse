@@ -56,9 +56,16 @@ Two pinned fixtures (solc 0.8.26 bin-runtime; tests assert exact offsets/selecto
 - `symbolic.py` — **M4.** Path-forking symbolic execution. `Const`/`Expr` values with a
   constant-folding smart constructor `mk()` (this is what resolves dynamic jumps: pushed
   return addresses fold to constants, so internal call/return "just works"). Forks at
-  symbolic JUMPI; loops cut after `max_block_visits` revisits (loops are *unrolled*, not
-  recovered). Word-granular symbolic memory recovers ABI returns / revert reasons (Error
-  string + Panic code). Products: `complete_cfg()` and a `TraceNode` tree of effect
+  symbolic JUMPI. Loops are recovered by *widening* (`_enter_block`): block revisits are
+  keyed by (dest, call-site fingerprint of return-address consts on the stack) so shared
+  internal helpers re-entered from many call sites aren't mistaken for loops; on the 2nd
+  same-key entry, stack slots / memory words that changed become fresh `LOOPVAR`s and the
+  body runs once on that generalized state; the 3rd entry emits a `LoopBack` marker that
+  M5 renders as `while`. If a changed slot is a return address (call sites the fingerprint
+  missed) widening is skipped and the old count-and-cut applies. Word-granular symbolic
+  memory recovers ABI returns / revert reasons (Error string + Panic code); RETURNDATA
+  values carry (call id, offset) and RETURNDATACOPY invalidates stale words — stale
+  aliasing used to create false equalities that pruned live branches. Products: `complete_cfg()` and a `TraceNode` tree of effect
   statements (SStore/Return/Revert/Log/Call/...) for M5. Expression args are stored in
   **pop order** (args[0] = stack top) — renderers must respect operand semantics.
   Bounded by `max_nodes` (default 8000, path-explosion guard) and a `max_seconds`
@@ -84,7 +91,9 @@ Two pinned fixtures (solc 0.8.26 bin-runtime; tests assert exact offsets/selecto
 
 **All five milestones implemented** (M1 disasm, M2 CFG, M3 functions/ABI, M4 symbolic,
 M5 decompile). Known limitations / future work:
-- loops are unrolled then truncated (`max_block_visits`), not recovered as `while`/`for`;
+- loops render as `while` via widening, but loop bodies show only *effect* statements —
+  pure stack arithmetic (accumulators) is invisible until SSA-style assignments exist,
+  so e.g. a sum loop shows `while (i1 <= arg0) { continue; }` with the accumulation implicit;
 - no SSA — expressions are re-rendered at each use, so repeated `storage[keccak(...)]`
   reads are verbose (no common-subexpression naming);
 - function return types are unknown (4byte signatures don't carry them);

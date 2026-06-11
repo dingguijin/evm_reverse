@@ -18,8 +18,9 @@ from __future__ import annotations
 from .ir import negate, render, render_revert, render_stmt, revert_annotation
 from .selectors import find_functions
 from .symbolic import (
-    Branch, Call, Comment, Const, Create, Expr, Log, Return, Revert, SStore,
-    SelfDestruct, Stmt, Stop, Sym, SymExec, TStore, TraceNode, is_pure_revert,
+    Branch, Call, Comment, Const, Create, Expr, Log, LoopBack, Return, Revert,
+    SStore, SelfDestruct, Stmt, Stop, Sym, SymExec, TStore, TraceNode,
+    is_pure_revert,
 )
 
 INDENT = "    "
@@ -107,12 +108,42 @@ def _require_line(cond: Sym, revert: Revert | None) -> str:
     return f"require({render(cond)});{suffix}"
 
 
+def _is_loop_body(node: TraceNode) -> bool:
+    """True if every leaf of this subtree loops back (or bails via revert)."""
+    found = [False]
+
+    def walk(n: TraceNode) -> bool:
+        if n.branch is not None:
+            return walk(n.branch.true) and walk(n.branch.false)
+        if any(isinstance(s, LoopBack) for s in n.stmts):
+            found[0] = True
+            return True
+        return is_pure_revert(n)
+
+    return walk(node) and found[0]
+
+
 def _emit_node(node: TraceNode, out: list[str], depth: int) -> None:
     pad = INDENT * depth
     for stmt in node.stmts:
         out.append(pad + render_stmt(stmt))
     br = node.branch
     if br is None:
+        return
+    # recovered loop: the arm whose every path jumps back is the body,
+    # the other arm is the code after the loop
+    t_loops, f_loops = _is_loop_body(br.true), _is_loop_body(br.false)
+    if t_loops and not f_loops:
+        out.append(pad + f"while ({render(br.cond)}) {{")
+        _emit_node(br.true, out, depth + 1)
+        out.append(pad + "}")
+        _emit_node(br.false, out, depth)
+        return
+    if f_loops and not t_loops:
+        out.append(pad + f"while ({render(negate(br.cond))}) {{")
+        _emit_node(br.false, out, depth + 1)
+        out.append(pad + "}")
+        _emit_node(br.true, out, depth)
         return
     if is_pure_revert(br.false):
         out.append(pad + _require_line(br.cond, _first_revert(br.false)))

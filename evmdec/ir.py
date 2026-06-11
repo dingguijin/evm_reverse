@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from .fourbyte import resolve_event
 from .symbolic import (
-    Call, Comment, Const, Create, Expr, Log, Return, Revert, SStore,
+    Call, Comment, Const, Create, Expr, Log, LoopBack, Return, Revert, SStore,
     SelfDestruct, Stop, Stmt, Sym, TStore,
 )
 
@@ -153,6 +153,8 @@ def render(sym: Sym) -> str:
         return f"stack_in{args[0].value}"
     if op == "CALLRET":
         return f"success{args[0].value}"
+    if op == "LOOPVAR":
+        return f"i{args[0].value}"
     if op == "RETURNDATA":
         if len(args) == 2 and args[1].value:
             return f"returndata{args[0].value}[0x{args[1].value:x}]"
@@ -219,6 +221,8 @@ def render_stmt(stmt: Stmt) -> str:
         return f"return ({', '.join(render(v) for v in stmt.values)});"
     if isinstance(stmt, Stop):
         return "return;"
+    if isinstance(stmt, LoopBack):
+        return "continue;"
     if isinstance(stmt, Revert):
         return render_revert(stmt)
     if isinstance(stmt, Log):
