@@ -109,7 +109,7 @@ def _pick_version(text: str) -> str:
     return lits[0] if lits else "0.8.26"
 
 
-def _standard_input(text: str) -> dict:
+def _standard_input(text: str, outputs: tuple[str, ...]) -> dict:
     """Wrap a source string as a solc standard-json input (already-json passes through)."""
     if text.lstrip().startswith("{"):
         inp = json.loads(text)
@@ -118,7 +118,7 @@ def _standard_input(text: str) -> dict:
             inp = {"language": "Solidity", "sources": inp}
     else:
         inp = {"language": "Solidity", "sources": {"main.sol": {"content": text}}}
-    inp.setdefault("settings", {})["outputSelection"] = {"*": {"*": ["abi"]}}
+    inp.setdefault("settings", {})["outputSelection"] = {"*": {"*": list(outputs)}}
     return inp
 
 
@@ -149,14 +149,14 @@ def _canon(inp: dict) -> str:
     return t
 
 
-def abi_selectors(text: str) -> set[int]:
-    """Compile and return the union of all contracts' function selectors."""
+def compile_output(text: str, outputs: tuple[str, ...] = ("abi",)) -> dict:
+    """Compile with the full retry ladder; return solc's standard-json output."""
     version = _pick_version(text)
     try:
         _ensure(version)
     except Exception:        # picked a non-existent release: start from cached
         version = "0.8.26"
-    inp = _standard_input(text)
+    inp = _standard_input(text, outputs)
     # version fallbacks for dialect errors: every version named in a pragma,
     # oldest first (early-0.8 code often needs the patch it was written for),
     # then each era's representative — the ABI doesn't depend on which
@@ -194,14 +194,21 @@ def abi_selectors(text: str) -> set[int]:
                 raise
     else:
         raise RuntimeError("solc retry budget exhausted")
-    sels: set[int] = set()
-    for fdict in out.get("contracts", {}).values():
-        for c in fdict.values():
-            for item in c.get("abi", []):
-                if item.get("type") == "function":
-                    args = ",".join(_canon(i) for i in item["inputs"])
-                    sels.add(keccak_sel(f"{item['name']}({args})"))
-    return sels
+    return out
+
+
+def compile_abi_items(text: str) -> list[dict]:
+    """Compile and return the union of all contracts' ABI items."""
+    return [item
+            for fdict in compile_output(text).get("contracts", {}).values()
+            for c in fdict.values()
+            for item in c.get("abi", [])]
+
+
+def abi_selectors(text: str) -> set[int]:
+    """Compile and return the union of all contracts' function selectors."""
+    return {keccak_sel(f"{i['name']}({','.join(_canon(x) for x in i['inputs'])})")
+            for i in compile_abi_items(text) if i.get("type") == "function"}
 
 
 def main() -> int:

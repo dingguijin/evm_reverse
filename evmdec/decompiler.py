@@ -18,8 +18,8 @@ from __future__ import annotations
 from .ir import negate, render, render_revert, render_stmt, revert_annotation
 from .selectors import find_functions
 from .symbolic import (
-    Branch, Call, Comment, Const, Create, Expr, Log, Revert, SStore,
-    SelfDestruct, Stmt, Sym, SymExec, TStore, TraceNode, is_pure_revert,
+    Branch, Call, Comment, Const, Create, Expr, Log, Return, Revert, SStore,
+    SelfDestruct, Stmt, Stop, Sym, SymExec, TStore, TraceNode, is_pure_revert,
 )
 
 INDENT = "    "
@@ -138,17 +138,25 @@ _STATE_READING = {"SLOAD", "TLOAD", "BALANCE", "EXTCODESIZE", "EXTCODEHASH",
 
 
 class _Analysis:
-    __slots__ = ("writes", "reads", "slots", "mappings")
+    __slots__ = ("writes", "reads", "truncated", "cut", "success",
+                 "slots", "mappings")
 
     def __init__(self):
         self.writes = False
         self.reads = False
+        self.truncated = False   # global budget cut: code genuinely unseen
+        self.cut = False         # any loop/path cut inside this subtree
+        self.success = False     # some path completed (Stop/Return)
         self.slots: set[int] = set()
         self.mappings: set[int] = set()
 
     @property
     def mutability(self) -> str:
-        if self.writes:
+        # A truncated trace can't prove the unexplored paths don't write.
+        # Loop cuts are tolerated only if some sibling path completed —
+        # otherwise the happy path (and its writes) was never explored,
+        # e.g. arg-decoding helpers re-entered past max_block_visits.
+        if self.writes or self.truncated or (self.cut and not self.success):
             return ""
         return " view" if self.reads else " pure"
 
@@ -178,6 +186,13 @@ def _analyze(node: TraceNode, acc: _Analysis | None = None) -> _Analysis:
                 acc.writes = True
             elif isinstance(s, Call) and s.kind != "STATICCALL":
                 acc.writes = True
+            elif isinstance(s, (Stop, Return)):
+                acc.success = True
+            elif isinstance(s, Comment) and "truncated" in s.text:
+                if "budget exceeded" in s.text:
+                    acc.truncated = True
+                else:
+                    acc.cut = True
             if isinstance(s, SStore) and isinstance(s.slot, Const):
                 acc.slots.add(s.slot.value)
             for v in s.__dict__.values():

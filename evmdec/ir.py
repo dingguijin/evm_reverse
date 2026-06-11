@@ -154,6 +154,8 @@ def render(sym: Sym) -> str:
     if op == "CALLRET":
         return f"success{args[0].value}"
     if op == "RETURNDATA":
+        if len(args) == 2 and args[1].value:
+            return f"returndata{args[0].value}[0x{args[1].value:x}]"
         return f"returndata{args[0].value}"
     if op == "NEWADDR":
         return f"new_contract{args[0].value}"

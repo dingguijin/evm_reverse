@@ -563,7 +563,9 @@ class SymExec:
                 Call(name, self._ctr, gas, to, value, self._read_words(memory, in_off, in_size))
             )
             if isinstance(out_off, Const) and isinstance(out_size, Const) and out_size.value:
-                memory[Const(out_off.value)] = Expr("RETURNDATA", (Const(self._ctr),))
+                for i in range(0, min(out_size.value, 0x200), 32):
+                    memory[Const(out_off.value + i)] = \
+                        Expr("RETURNDATA", (Const(self._ctr), Const(i)))
             stack.append(Expr("CALLRET", (Const(self._ctr),)))
         elif name in ("CREATE", "CREATE2"):
             value, off, size = self._pop(stack), self._pop(stack), self._pop(stack)
@@ -578,7 +580,22 @@ class SymExec:
                     and length.value <= 0x200:
                 for i in range(0, length.value, 32):
                     memory[Const(dst.value + i)] = Expr("CALLDATALOAD", (Const(src.value + i),))
-        elif name in ("RETURNDATACOPY", "CODECOPY", "EXTCODECOPY", "MCOPY"):
+        elif name == "RETURNDATACOPY":
+            dst, src, length = self._pop(stack), self._pop(stack), self._pop(stack)
+            if isinstance(dst, Const) and isinstance(src, Const) \
+                    and isinstance(length, Const) and length.value <= 0x200:
+                for i in range(0, length.value, 32):
+                    memory[Const(dst.value + i)] = \
+                        Expr("RETURNDATA", (Const(self._ctr), Const(src.value + i)))
+            else:
+                # unknown destination: drop tracked words rather than let later
+                # loads read stale data (false equalities prune live branches);
+                # keep the free-memory pointer, solc reads it everywhere
+                fmp = memory.get(Const(0x40))
+                memory.clear()
+                if fmp is not None:
+                    memory[Const(0x40)] = fmp
+        elif name in ("CODECOPY", "EXTCODECOPY", "MCOPY"):
             for _ in range(op.ins):
                 self._pop(stack)
         else:
